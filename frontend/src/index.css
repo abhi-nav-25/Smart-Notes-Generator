@@ -34,7 +34,17 @@ body {
 }
 
 #root {
+  width: 100%;
+  max-width: 100%;
   min-height: 100svh;
+  overflow-x: hidden;
+}
+
+html,
+body {
+  width: 100%;
+  max-width: 100%;
+  overflow-x: hidden;
 }
 
 p {

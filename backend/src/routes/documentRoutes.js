@@ -1,6 +1,6 @@
 const express = require('express');
 const multer = require('multer');
-const { uploadDocument } = require('../controllers/documentController');
+const { uploadDocument, generateQuiz, generateNotes } = require('../controllers/documentController');
 
 const router = express.Router();
 
@@ -20,5 +20,7 @@ const upload = multer({
 });
 
 router.post('/upload', upload.single('file'), uploadDocument);
+router.post('/quiz', generateQuiz);
+router.post('/generate-notes', generateNotes);
 
 module.exports = router;
