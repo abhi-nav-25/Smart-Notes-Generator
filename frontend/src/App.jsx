@@ -3,6 +3,7 @@ import './App.css'
 const BACKEND_URL = (
   import.meta.env.VITE_BACKEND_URL || 'http://localhost:5000'
 ).replace(/\/$/, '')
+console.log('BACKEND_URL:', BACKEND_URL)
 const HISTORY_STORAGE_KEY = 'smart-notes-history'
 
 const readHistory = () => {
