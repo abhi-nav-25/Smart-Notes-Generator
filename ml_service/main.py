@@ -454,6 +454,173 @@ def _ensure_headings_on_own_line(text: str) -> str:
     return re.sub(r'(?<!\n)(?<!\A)(#{1,6}\s+\S)', r'\n\n\1', text)
 
 
+# A small, topic-agnostic list of linking/definition verbs used to spot a
+# heading-like phrase that has been glued directly onto the sentence that
+# follows it (e.g. "Network Topologies A network topology is ..."). None of
+# these verbs are tied to any particular subject matter.
+_HEADING_VERB_RE = (
+    r'(?:is|are|was|were|refers to|means|describes|consists of|includes|'
+    r'provides|defines|represents|involves|enables?|allows?|continues?\s+to|'
+    r'helps?|contains?|comprises?)'
+)
+
+# Matches: an optional bullet marker, then a short run (1-6 words) of
+# Title-Case words sitting at the very start of a line, immediately
+# followed by what looks like the start of a new sentence (a capitalized
+# word, then a short run of lowercase words, then a linking/definition
+# verb). This is the generic signature of a heading that got merged into
+# the paragraph or bullet that should follow it.
+_GLUED_HEADING_RE = re.compile(
+    r'^(?P<indent>[ \t]*)(?P<bullet>[-*]\s+)?'
+    r'(?P<heading>(?:[A-Z][\w/&-]*\s+){0,5}[A-Z][\w/&-]*)\s+'
+    r'(?P<sentence>[A-Z][\w/&-]*(?:\s+[a-z][\w/&-]*){0,8}?\s+' + _HEADING_VERB_RE + r'\b.*)$',
+    re.MULTILINE,
+)
+
+
+def _repair_glued_headings(text: str) -> str:
+    """
+    Repairs headings that were merged into the following text or into a
+    bullet point (Requirement A). Purely structural/pattern-based - it
+    never references specific heading names or topics, so it behaves the
+    same way regardless of what the document is about. Known limitation:
+    a sentence that happens to open with a multi-word proper-noun subject
+    can occasionally be mis-split; this only matters at the very start of
+    a line, which keeps the false-positive surface small.
+    """
+    def _replace(match):
+        heading = match.group('heading').strip()
+        sentence = match.group('sentence').strip()
+        if len(heading.split()) > 6 or len(heading) > 60 or len(heading) < 2:
+            return match.group(0)
+        return f"\n\n### {heading}\n\n{sentence}"
+
+    return _GLUED_HEADING_RE.sub(_replace, text)
+
+
+def _convert_tables_to_bullets(text: str) -> str:
+    """
+    Converts any pipe-delimited Markdown table in the text into a plain
+    bulleted list, using the required format:
+    "- **<first column>:** <remaining columns>." The first row of the
+    block is treated as a header and skipped; the first column of every
+    data row becomes the concept, and the remaining columns (joined) become
+    its explanation. Tables must never be reproduced as Markdown tables.
+    This only touches blocks that already look tabular (multiple
+    '|'-delimited rows), so it never invents a table - or bullets - from
+    ordinary prose, and it never fabricates a value for a missing cell.
+    """
+    lines = text.split('\n')
+    output = []
+    i = 0
+    n = len(lines)
+
+    def _cells(row):
+        return [c.strip() for c in row.strip().strip('|').split('|')]
+
+    separator_re = re.compile(r'^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$')
+
+    while i < n:
+        line = lines[i]
+        if line.count('|') >= 1:
+            block = [line]
+            j = i + 1
+            while j < n and lines[j].count('|') >= 1:
+                block.append(lines[j])
+                j += 1
+
+            # Drop an optional Markdown separator row ("---|---").
+            data_rows = [row for row in block if not separator_re.match(row)]
+
+            bullet_lines = []
+            if len(data_rows) >= 2:
+                for row in data_rows[1:]:
+                    cells = _cells(row)
+                    if not cells or not cells[0]:
+                        continue
+                    concept = cells[0]
+                    explanation_cells = [c for c in cells[1:] if c]
+                    if not explanation_cells:
+                        continue
+                    explanation = ' '.join(explanation_cells).strip()
+                    bullet_lines.append(f"- **{concept}:** {explanation}")
+
+            if bullet_lines:
+                output.extend(bullet_lines)
+                i = j
+                continue
+
+            # Not a clear enough table structure - leave the lines as they
+            # were rather than guessing at a reconstruction.
+            output.extend(block)
+            i = j
+            continue
+
+        output.append(line)
+        i += 1
+
+    return '\n'.join(output)
+
+
+def _bullets_to_pseudo_sentences(text: str) -> str:
+    """
+    Turns "- **Concept:** Explanation" bullet lines (as produced by
+    _convert_tables_to_bullets) into plain "Concept: Explanation."
+    sentences, so the local sentence-extraction fallback below can still
+    surface information that originally came from a source table.
+    """
+    def _replace(match):
+        concept = match.group(1).strip()
+        explanation = match.group(2).strip()
+        if not explanation.endswith(('.', '!', '?')):
+            explanation += '.'
+        return f"{concept}: {explanation}"
+
+    return re.sub(r'^-\s+\*\*(.+?):\*\*\s*(.+)$', _replace, text, flags=re.MULTILINE)
+
+
+def _prepare_source_for_fallback(text: str) -> str:
+    """
+    Pre-processes source text for the local (non-Gemini) fallback
+    generators so that table content is represented as plain sentence-like
+    lines instead of being silently dropped by the extractive approach.
+    """
+    return _bullets_to_pseudo_sentences(_convert_tables_to_bullets(text))
+
+
+# Generic list-context words that indicate a run of single digits is
+# actually separate enumerated items (e.g. "steps 1 2 3") rather than a
+# number that got split apart by OCR/PDF extraction. None of these are
+# specific to any one document's subject matter.
+_DIGIT_LIST_CONTEXT_RE = (
+    r'(?:figure|figures|table|tables|step|steps|chapter|chapters|section|'
+    r'sections|question|questions|option|options|type|types|item|items|'
+    r'number|numbers|point|points|rule|rules|level|levels|phase|phases|'
+    r'stage|stages)\s*:?\s*$'
+)
+
+_SPLIT_DIGITS_RE = re.compile(r'(?<![\d.])\d(?:\s+\d){2,}(?![\d.])')
+
+
+def _repair_split_digit_numbers(text: str) -> str:
+    """
+    Detects a run of 3+ standalone single digits separated by whitespace
+    (e.g. "1 9 6") and joins them into one number ("196"). This pattern
+    is an unambiguous signature of OCR/PDF extraction corruption -
+    natural language essentially never contains three or more consecutive
+    standalone single-digit numbers. Runs preceded by a generic listy word
+    ("step 1 2 3") are left untouched since those really are separate
+    items, not a corrupted number (Requirement F).
+    """
+    def _replace(match):
+        preceding = text[max(0, match.start() - 20):match.start()].lower()
+        if re.search(_DIGIT_LIST_CONTEXT_RE, preceding):
+            return match.group(0)
+        return re.sub(r'\s+', '', match.group(0))
+
+    return _SPLIT_DIGITS_RE.sub(_replace, text)
+
+
 def _remove_duplicate_note_lines(notes: str) -> str:
     lines = notes.splitlines()
     result = []
@@ -516,7 +683,8 @@ def _remove_document_title(text: str) -> str:
 def clean_notes_output(notes: str) -> str:
     """
     Cleans common formatting problems in generated notes. Every rule here
-    is generic (title-glue, escaped markdown, duplicate lines/sections,
+    is generic (title-glue, escaped markdown, glued headings, table-to-
+    bullet conversion, split-digit corruption, duplicate lines/sections,
     stray code fences) and applies regardless of what the source document
     is about.
     """
@@ -536,6 +704,12 @@ def clean_notes_output(notes: str) -> str:
 
     notes = _unescape_markdown(notes)
     notes = _ensure_headings_on_own_line(notes)
+
+    # Repair headings that were merged into surrounding text or bullets,
+    # then convert any table the model returned into readable bullets.
+    notes = _repair_glued_headings(notes)
+    notes = _convert_tables_to_bullets(notes)
+    notes = _repair_split_digit_numbers(notes)
 
     notes = re.sub(r"(?m)^(#{1,6}\s+.+)\n+\1\s*$", r"\1", notes, flags=re.IGNORECASE)
     notes = _remove_document_title(notes)
@@ -579,6 +753,211 @@ def clean_notes_output(notes: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Source-grounding validation (generic - checks notes against the source
+# document itself, never against topic-specific rules or facts)
+# ---------------------------------------------------------------------------
+
+def _line_is_grounded(line: str, source_words: set, source_acronyms: set) -> bool:
+    """
+    A line counts as grounded if it shares enough substantive vocabulary
+    with the source document, and if it does not introduce an acronym (a
+    named algorithm, protocol, etc.) that never appears in the source at
+    all - a generic signal of injected outside knowledge. Top-level "##"
+    section headings and the standard "not covered" placeholder are always
+    kept untouched; only actual content lines and content sub-headings
+    ("###" and deeper) are checked.
+    """
+    stripped = line.strip()
+    if not stripped:
+        return True
+    if re.match(r'^##(?!#)\s+', stripped):
+        return True
+    if stripped.lstrip('-* ').strip().lower() == 'not covered in the source document.':
+        return True
+
+    heading_match = re.match(r'^#{3,6}\s+(.*)$', stripped)
+    check_text = heading_match.group(1) if heading_match else stripped
+
+    # Acronym check: a capitalized short token (e.g. a named algorithm or
+    # protocol abbreviation) that never appears in the source at all is a
+    # strong, topic-agnostic sign of injected external knowledge.
+    line_acronyms = set(re.findall(r'\b[A-Z]{2,6}\b', check_text))
+    if line_acronyms and not line_acronyms.issubset(source_acronyms):
+        return False
+
+    content_words = set(re.findall(r'[a-z]{4,}', check_text.lower()))
+    if not content_words:
+        return True
+
+    overlap = len(content_words & source_words)
+    overlap_ratio = overlap / len(content_words)
+
+    # Short lines need a higher overlap ratio, since a single unrelated
+    # word can dominate a short line's word count.
+    threshold = 0.35 if len(content_words) > 6 else 0.5
+    return overlap_ratio >= threshold
+
+
+def _strip_ungrounded_lines(notes: str, source: str) -> str:
+    """
+    Validation step (Requirement C): removes individual lines whose
+    vocabulary doesn't meaningfully overlap with the source document, or
+    that introduce an acronym absent from the source entirely. This is how
+    invented/hallucinated content - including unsupported named concepts -
+    gets filtered out without discarding the entire notes document.
+    """
+    source_words = set(re.findall(r'[a-z]{4,}', source.lower()))
+    source_acronyms = set(re.findall(r'\b[A-Z]{2,6}\b', source))
+    if not source_words:
+        return notes
+
+    kept_lines = [
+        line for line in notes.splitlines()
+        if _line_is_grounded(line, source_words, source_acronyms)
+    ]
+    return '\n'.join(kept_lines)
+
+
+def _fill_empty_sections(notes: str) -> str:
+    """
+    After grounding validation removes unsupported lines, a section can
+    be left with nothing but its heading. Make that explicit instead of
+    leaving a blank section under the heading.
+    """
+    sections = re.split(r'(?=^##\s+)', notes, flags=re.MULTILINE)
+    rebuilt = []
+
+    for section in sections:
+        stripped_section = section.strip()
+        if not stripped_section:
+            continue
+        if stripped_section.startswith('##'):
+            lines = stripped_section.splitlines()
+            heading = lines[0]
+            body = '\n'.join(lines[1:]).strip()
+            if not body:
+                body = 'Not covered in the source document.'
+            rebuilt.append(f"{heading}\n\n{body}")
+        else:
+            rebuilt.append(stripped_section)
+
+    return '\n\n'.join(rebuilt)
+
+
+def _shared_long_ngram_exists(text_a: str, text_b: str, max_window: int = 15, min_window: int = 8) -> bool:
+    """
+    Checks whether text_a contains a long word-sequence that also appears
+    verbatim in text_b. Used to detect near-verbatim copying regardless of
+    topic - it's purely a structural (shared n-gram length) check.
+    """
+    words_a = re.findall(r'\w+', text_a.lower())
+    if len(words_a) < min_window:
+        return False
+
+    joined_b = ' '.join(re.findall(r'\w+', text_b.lower()))
+
+    window_ceiling = min(max_window, len(words_a))
+    for window in range(window_ceiling, min_window - 1, -1):
+        for start in range(0, len(words_a) - window + 1):
+            phrase = ' '.join(words_a[start:start + window])
+            if phrase in joined_b:
+                return True
+    return False
+
+
+def _overview_is_copied(overview_text: str, source: str) -> bool:
+    """
+    Flags an Overview that is essentially lifted from the source rather
+    than summarized (Requirement E).
+    """
+    return _shared_long_ngram_exists(overview_text, source, max_window=15, min_window=8)
+
+
+def _summary_is_near_verbatim_copy(summary: str, source: str) -> bool:
+    """
+    Flags a summary that is essentially copied from the source rather than
+    paraphrased. Uses a longer minimum shared run than the Overview check,
+    since some technical-term overlap in a summary is expected and fine.
+    """
+    return _shared_long_ngram_exists(summary, source, max_window=20, min_window=12)
+
+
+def _condensed_overview_fallback(source: str) -> str:
+    """Local, no-API-call fallback for an Overview that copied the source."""
+    extractive = _build_extractive_summary(_prepare_source_for_fallback(source))
+    sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', extractive) if s.strip()]
+    return ' '.join(sentences[:2]) or "Overview not available."
+
+
+def _fix_overview_section(notes: str, source: str) -> str:
+    """
+    Checks the Overview section specifically for verbatim copying and
+    replaces it with a short, locally-generated condensed version if so
+    (Requirement E). Leaves the rest of the notes untouched.
+    """
+    match = re.search(
+        r'(##\s+Overview\s*\n+)(.*?)(?=\n##\s+|\Z)', notes, flags=re.DOTALL | re.IGNORECASE
+    )
+    if not match:
+        return notes
+
+    heading, body = match.group(1), match.group(2).strip()
+    if body and _overview_is_copied(body, source):
+        body = _condensed_overview_fallback(source)
+
+    return notes[:match.start()] + heading + body + '\n\n' + notes[match.end():]
+
+
+def _ensure_quick_revision_populated(notes: str) -> str:
+    """
+    If Quick Revision ended up empty (e.g. every candidate point was
+    removed during grounding validation), populate it with a handful of
+    short points pulled from whichever other sections actually have
+    supported content, instead of leaving it blank (Requirement: Quick
+    Revision must not be empty when supported content exists elsewhere).
+    Nothing new is introduced - points are copied from already-validated
+    sections.
+    """
+    match = re.search(
+        r'(##\s+Quick Revision\s*\n+)(.*?)(?=\n##\s+|\Z)', notes, flags=re.DOTALL | re.IGNORECASE
+    )
+    if not match:
+        return notes
+
+    heading, body = match.group(1), match.group(2).strip()
+    if body and body.lower() != 'not covered in the source document.':
+        return notes
+
+    donor_sections = [
+        'Key Concepts',
+        'Main Components or Classification',
+        'Important Details',
+        'Examples or Applications',
+    ]
+    revision_points = []
+    for section_name in donor_sections:
+        section_match = re.search(
+            rf'##\s+{re.escape(section_name)}\s*\n+(.*?)(?=\n##\s+|\Z)',
+            notes,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        if not section_match:
+            continue
+        section_body = section_match.group(1).strip()
+        bullet_lines = [
+            l.strip() for l in section_body.splitlines()
+            if l.strip().startswith('-') and l.strip().lower() != '- not covered in the source document.'
+        ]
+        if bullet_lines:
+            revision_points.append(bullet_lines[0])
+        if len(revision_points) >= 5:
+            break
+
+    new_body = '\n'.join(revision_points) if revision_points else 'Not covered in the source document.'
+    return notes[:match.start()] + heading + new_body + '\n\n' + notes[match.end():]
+
+
+# ---------------------------------------------------------------------------
 # Prompts
 # ---------------------------------------------------------------------------
 
@@ -589,8 +968,13 @@ studying this material.
 Rules:
 - Write flowing prose (2 to 4 short paragraphs). Do not use a list or any
   Markdown formatting.
+- Paraphrase the source in your own words. Do not copy sentences verbatim
+  from the source document.
+- Use only information explicitly present in the source document below.
+  Do not add external knowledge, examples, or facts that are not stated
+  in the source.
+- Do not add a conclusion unless the source document itself states one.
 - Do not repeat words, phrases, or sentences.
-- Do not invent information that is not in the source document.
 - Preserve important technical terms from the document.
 - Combine similar points instead of repeating them.
 - Focus only on the main ideas and important details.
@@ -612,34 +996,66 @@ headings) to whatever the document is actually about:
 # Study Notes
 
 ## Overview
-A short explanation of the main topic.
+A concise, paraphrased explanation of the main topic, based only on the
+source below.
 
 ## Key Concepts
-- The important concepts, terms, and definitions found in the document.
+- Definitions, principles, and terminology explicitly present in the
+  source.
 
 ## Main Components or Classification
-- Types, categories, steps, stages, or components described in the
-  document, if any are present.
+- Types, categories, stages, or components explicitly described in the
+  source. Do not force unrelated content into this section.
 
 ## Important Details
-- Important facts, rules, formulas, or explanations from the document.
+- Other source-supported facts, rules, or explanations that do not fit
+  naturally into the sections above.
 
 ## Examples or Applications
-- Examples or applications, only if the document actually contains them.
+- Examples or applications, only if the source actually contains them.
 
 ## Quick Revision
-- The most important points already covered above, restated briefly.
+- 3 to 5 short points that restate information already covered above.
 - Do not introduce anything new in this section.
 
-Rules:
-- Use only information from the source document below. Do not invent facts.
+TABLE HANDLING:
+- If the source contains a table, read every row and column carefully.
+- Do NOT reproduce the table as a Markdown table.
+- Convert each table row into a bullet point using this exact format:
+  - **<first column>:** <remaining columns, combined into one sentence>.
+- Treat the first column as the concept and the remaining columns as its
+  explanation.
+- Preserve every readable row. Do not merge unrelated rows and do not
+  invent missing values.
+- Place these bullets under whichever section best matches their content
+  (usually Key Concepts, Main Components or Classification, or Important
+  Details).
+
+CONTENT RULES:
+- Use only information explicitly present in the source document below,
+  including information from any tables. Do not add external knowledge,
+  examples, explanations, algorithms, definitions, applications, named
+  concepts, or conclusions that are not stated in the source.
+- Place each fact under the single most relevant section based on its
+  meaning. Do not assign content to a section merely because of where it
+  appeared in the source (for example, do not just take "the first few
+  sentences" for one section and "the next few" for another).
+- Do not repeat the same fact in more than one section, except that Quick
+  Revision may restate points already made elsewhere.
 - If a section has no relevant content in the source, write exactly
   "Not covered in the source document." under that heading.
-- Avoid repeating the same point across multiple sections.
-- Do not include an introductory phrase such as "Here are the notes".
+
+FORMATTING RULES:
+- Every heading must be on its own line. Never merge a heading into the
+  sentence or bullet that follows it (for example, never write
+  "Network Topologies A network topology is..." on one line - the heading
+  and the sentence must be separated).
+- Never split a multi-digit number across separate characters or words
+  (write "196", never "1 9 6").
+- Do not escape Markdown characters with a backslash - write "##" and
+  "**", never "\\##" or "\\**".
 - Do not wrap the output in code fences.
-- Do not escape Markdown characters with a backslash - write "##", never
-  "\\##".
+- Do not include an introductory phrase such as "Here are the notes".
 - Return only the Markdown notes, nothing else.
 
 SOURCE DOCUMENT:
@@ -874,8 +1290,13 @@ def _generate_summary_from_text(cleaned_text: str) -> str:
     except HTTPException as exc:
         print(f"Gemini summary generation failed, using fallback: {exc.detail}")
 
-    if _summary_needs_fallback(summary, cleaned_text) or _summary_is_instruction_heavy(summary):
-        summary = _build_extractive_summary(cleaned_text)
+    if (
+        _summary_needs_fallback(summary, cleaned_text)
+        or _summary_is_instruction_heavy(summary)
+        or _summary_is_near_verbatim_copy(summary, cleaned_text)
+    ):
+        fallback_source = _prepare_source_for_fallback(cleaned_text)
+        summary = _build_extractive_summary(fallback_source)
         summary = _remove_instruction_sentences(summary)
         summary = _remove_similar_sentences(summary)
         summary = _remove_repeated_phrases(summary)
@@ -892,11 +1313,23 @@ def _generate_notes_from_text(cleaned_text: str) -> str:
             max_output_tokens=1800,
         )
         notes = clean_notes_output(raw_notes)
+
+        # --- Source-grounding validation pipeline (Requirement C) ---------
+        # These steps check the model's output against the source document
+        # itself - never against topic-specific facts or rules - and strip
+        # or repair anything that isn't actually supported by the source.
+        notes = _strip_ungrounded_lines(notes, cleaned_text)
+        notes = _fill_empty_sections(notes)
+        notes = _fix_overview_section(notes, cleaned_text)
+        notes = _ensure_quick_revision_populated(notes)
+        notes = _normalize_markdown_spacing(notes)
     except HTTPException as exc:
         print(f"Gemini notes generation failed, using fallback: {exc.detail}")
+        notes = ""
 
     if not notes_are_valid(notes) or _notes_need_fallback(notes, cleaned_text):
-        notes = clean_notes_output(_build_markdown_notes(cleaned_text))
+        fallback_source = _prepare_source_for_fallback(cleaned_text)
+        notes = clean_notes_output(_build_markdown_notes(fallback_source))
 
     return notes
 
