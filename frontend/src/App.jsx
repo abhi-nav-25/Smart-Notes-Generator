@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import './App.css'
-
+const ML_SERVICE_URL =
+  import.meta.env.VITE_ML_SERVICE_URL || 'http://localhost:8000'
 const HISTORY_STORAGE_KEY = 'smart-notes-history'
 
 const readHistory = () => {
@@ -197,7 +198,7 @@ function App() {
     setIsQuizModalOpen(false)
 
     try {
-      const response = await fetch('http://localhost:5000/api/documents/upload', {
+      const response = await fetch(`${ML_SERVICE_URL}/api/documents/upload`, {
         method: 'POST',
         body: formData,
       })
@@ -253,7 +254,7 @@ function App() {
     setGeneratedNotes('')
 
     try {
-      const response = await fetch('http://localhost:5000/api/documents/generate-notes', {
+      const response = await fetch(`${ML_SERVICE_URL}/api/documents/generate-notes`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -306,7 +307,7 @@ function App() {
     setIsQuizModalOpen(true)
 
     try {
-      const response = await fetch('http://localhost:5000/api/documents/quiz', {
+      const response = await fetch(`${ML_SERVICE_URL}/api/documents/quiz`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
