@@ -71,7 +71,19 @@ const downloadText = (content, filename) => {
 }
 
 const renderNotes = (text) => {
-  const lines = text.split(/\r?\n/)
+  const rawLines = text.split(/\r?\n/)
+  const lines = []
+  rawLines.forEach((line) => {
+    const trimmed = line.trim()
+    const isStructure = /^(#{1,6}\s+|[-*+]\s+|\d+[.)]\s+)/.test(trimmed) || /^##?\s*(overview|key concepts|main components|important details|examples|quick revision|conclusion)/i.test(trimmed)
+    if (!trimmed) {
+      if (lines.length && lines[lines.length - 1] !== '') lines.push('')
+    } else if (isStructure || !lines.length || lines[lines.length - 1] === '') {
+      lines.push(trimmed)
+    } else {
+      lines[lines.length - 1] = `${lines[lines.length - 1]} ${trimmed}`
+    }
+  })
   const elements = []
   let paragraphLines = []
   let listItems = []
